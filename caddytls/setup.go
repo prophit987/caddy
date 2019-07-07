@@ -21,28 +21,40 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/telemetry"
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/telemetry"
 	"github.com/mholt/certmagic"
 )
 
 func init() {
+	// opt-in TLS 1.3 for Go1.12
+	// TODO: remove this line when Go1.13 is released.
+	if err := os.Setenv("GODEBUG", os.Getenv("GODEBUG")+",tls13=1"); err != nil {
+		log.Println("[ERROR] failed to set environment variable: ", err)
+	}
+
 	caddy.RegisterPlugin("tls", caddy.Plugin{Action: setupTLS})
 
 	// ensure the default Storage implementation is plugged in
-	caddy.RegisterClusterPlugin("file", constructDefaultClusterPlugin)
+	RegisterClusterPlugin("file", constructDefaultClusterPlugin)
 }
 
 // setupTLS sets up the TLS configuration and installs certificates that
 // are specified by the user in the config file. All the automatic HTTPS
 // stuff comes later outside of this function.
 func setupTLS(c *caddy.Controller) error {
+	if err := makeClusteringPlugin(); err != nil {
+		return err
+	}
+
 	configGetter, ok := configGetters[c.ServerType()]
 	if !ok {
 		return fmt.Errorf("no caddytls.ConfigGetter for %s server type; must call RegisterConfigGetter", c.ServerType())
@@ -53,18 +65,6 @@ func setupTLS(c *caddy.Controller) error {
 	}
 
 	config.Enabled = true
-
-	// a single certificate cache is used by the whole caddy.Instance; get a pointer to it
-	certCache, ok := c.Get(CertCacheInstStorageKey).(*certmagic.Cache)
-	if !ok || certCache == nil {
-		certCache = certmagic.NewCache(certmagic.DefaultStorage)
-		c.OnShutdown(func() error {
-			certCache.Stop()
-			return nil
-		})
-		c.Set(CertCacheInstStorageKey, certCache)
-	}
-	config.Manager = certmagic.NewWithCache(certCache, certmagic.Config{})
 
 	// we use certmagic events to collect metrics for telemetry
 	config.Manager.OnEvent = func(event string, data interface{}) {
@@ -290,11 +290,8 @@ func setupTLS(c *caddy.Controller) error {
 		if onDemand {
 			config.Manager.OnDemand = new(certmagic.OnDemandConfig)
 			if maxCerts != "" {
-				maxCertsNum, err := strconv.Atoi(maxCerts)
-				if err != nil || maxCertsNum < 1 {
-					return c.Err("max_certs must be a positive integer")
-				}
-				config.Manager.OnDemand.MaxObtain = int32(maxCertsNum)
+				log.Println("[WARNING] The max_certs subdirective is now deprecated and offers no protection; please use ask instead.")
+				fmt.Printf("WARNING: The max_certs subdirective is now deprecated and offers no protection; please use ask instead.")
 			}
 			if askURL != "" {
 				parsedURL, err := url.Parse(askURL)
@@ -304,7 +301,29 @@ func setupTLS(c *caddy.Controller) error {
 				if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 					return c.Err("ask URL must use http or https")
 				}
-				config.Manager.OnDemand.AskURL = parsedURL
+				config.Manager.OnDemand.DecisionFunc = func(name string) error {
+					askURLParsed, err := url.Parse(askURL)
+					if err != nil {
+						return fmt.Errorf("parsing ask URL: %v", err)
+					}
+					qs := askURLParsed.Query()
+					qs.Set("domain", name)
+					askURLParsed.RawQuery = qs.Encode()
+
+					resp, err := onDemandAskClient.Get(askURLParsed.String())
+					if err != nil {
+						return fmt.Errorf("error checking %v to deterine if certificate for hostname '%s' should be allowed: %v",
+							askURL, name, err)
+					}
+					resp.Body.Close()
+
+					if resp.StatusCode < 200 || resp.StatusCode > 299 {
+						return fmt.Errorf("certificate for hostname '%s' not allowed; non-2xx status code %d returned from %v",
+							name, resp.StatusCode, askURL)
+					}
+
+					return nil
+				}
 			}
 		}
 
@@ -315,7 +334,7 @@ func setupTLS(c *caddy.Controller) error {
 
 		// load a single certificate and key, if specified
 		if certificateFile != "" && keyFile != "" {
-			err := config.Manager.CacheUnmanagedCertificatePEMFile(certificateFile, keyFile)
+			err := config.Manager.CacheUnmanagedCertificatePEMFile(certificateFile, keyFile, nil)
 			if err != nil {
 				return c.Errf("Unable to load certificate and key files for '%s': %v", c.Key, err)
 			}
@@ -342,12 +361,20 @@ func setupTLS(c *caddy.Controller) error {
 		if err != nil {
 			return fmt.Errorf("self-signed certificate generation: %v", err)
 		}
-		err = config.Manager.CacheUnmanagedTLSCertificate(ssCert)
+		err = config.Manager.CacheUnmanagedTLSCertificate(ssCert, nil)
 		if err != nil {
 			return fmt.Errorf("self-signed: %v", err)
 		}
 		telemetry.Increment("tls_self_signed_count")
 	}
+
+	// store this as a custom config
+	cfgMap, ok := c.Get(configMapKey).(map[string]*Config)
+	if !ok || cfgMap == nil {
+		cfgMap = make(map[string]*Config)
+	}
+	cfgMap[config.Hostname] = config
+	c.Set(configMapKey, cfgMap)
 
 	return nil
 }
@@ -387,26 +414,34 @@ func loadCertsInDir(cfg *Config, c *caddy.Controller, dir string) error {
 
 				if derBlock.Type == "CERTIFICATE" {
 					// Re-encode certificate as PEM, appending to certificate chain
-					pem.Encode(certBuilder, derBlock)
+					if err := pem.Encode(certBuilder, derBlock); err != nil {
+						log.Println("[ERROR] failed to write PEM encoding: ", err)
+					}
 				} else if derBlock.Type == "EC PARAMETERS" {
 					// EC keys generated from openssl can be composed of two blocks:
 					// parameters and key (parameter block should come first)
 					if !foundKey {
 						// Encode parameters
-						pem.Encode(keyBuilder, derBlock)
+						if err := pem.Encode(keyBuilder, derBlock); err != nil {
+							log.Println("[ERROR] failed to write PEM encoding: ", err)
+						}
 
 						// Key must immediately follow
 						derBlock, bundle = pem.Decode(bundle)
 						if derBlock == nil || derBlock.Type != "EC PRIVATE KEY" {
 							return c.Errf("%s: expected elliptic private key to immediately follow EC parameters", path)
 						}
-						pem.Encode(keyBuilder, derBlock)
+						if err := pem.Encode(keyBuilder, derBlock); err != nil {
+							log.Println("[ERROR] failed to write PEM encoding: ", err)
+						}
 						foundKey = true
 					}
 				} else if derBlock.Type == "PRIVATE KEY" || strings.HasSuffix(derBlock.Type, " PRIVATE KEY") {
 					// RSA key
 					if !foundKey {
-						pem.Encode(keyBuilder, derBlock)
+						if err := pem.Encode(keyBuilder, derBlock); err != nil {
+							log.Println("[ERROR] failed to write PEM encoding: ", err)
+						}
 						foundKey = true
 					}
 				} else {
@@ -422,7 +457,7 @@ func loadCertsInDir(cfg *Config, c *caddy.Controller, dir string) error {
 				return c.Errf("%s: no private key block found", path)
 			}
 
-			err = cfg.Manager.CacheUnmanagedCertificatePEMBytes(certPEMBytes, keyPEMBytes)
+			err = cfg.Manager.CacheUnmanagedCertificatePEMBytes(certPEMBytes, keyPEMBytes, nil)
 			if err != nil {
 				return c.Errf("%s: failed to load cert and key for '%s': %v", path, c.Key, err)
 			}
@@ -432,6 +467,39 @@ func loadCertsInDir(cfg *Config, c *caddy.Controller, dir string) error {
 	})
 }
 
+func makeClusteringPlugin() error {
+	// set up the clustering plugin, if there is one (and there should always
+	// be one since this tls plugin requires it) -- this should be done exactly
+	// once, but we can't do it during init while plugins are still registering,
+	// so do it as soon as we run a setup)
+	if atomic.CompareAndSwapInt32(&clusterPluginSetup, 0, 1) {
+		clusterPluginName := os.Getenv("CADDY_CLUSTERING")
+		if clusterPluginName == "" {
+			clusterPluginName = "file" // name of default storage plugin
+		}
+		clusterFn, ok := clusterProviders[clusterPluginName]
+		if ok {
+			storage, err := clusterFn()
+			if err != nil {
+				return fmt.Errorf("constructing cluster plugin %s: %v", clusterPluginName, err)
+			}
+			certmagic.Default.Storage = storage
+		} else {
+			return fmt.Errorf("unrecognized cluster plugin (was it included in the Caddy build?): %s", clusterPluginName)
+		}
+	}
+	return nil
+}
+
 func constructDefaultClusterPlugin() (certmagic.Storage, error) {
 	return &certmagic.FileStorage{Path: caddy.AssetsPath()}, nil
 }
+
+var onDemandAskClient = &http.Client{
+	Timeout: 10 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return fmt.Errorf("following http redirects is not allowed")
+	},
+}
+
+const configMapKey = "tls_custom_configs"

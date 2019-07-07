@@ -27,19 +27,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddyfile"
-	"github.com/mholt/caddy/caddyhttp/staticfiles"
-	"github.com/mholt/caddy/caddytls"
-	"github.com/mholt/caddy/telemetry"
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/caddyfile"
+	"github.com/caddyserver/caddy/caddyhttp/staticfiles"
+	"github.com/caddyserver/caddy/caddytls"
+	"github.com/caddyserver/caddy/telemetry"
 	"github.com/mholt/certmagic"
 )
 
 const serverType = "http"
 
 func init() {
-	flag.StringVar(&HTTPPort, "http-port", HTTPPort, "Default port to use for HTTP")
-	flag.StringVar(&HTTPSPort, "https-port", HTTPSPort, "Default port to use for HTTPS")
+	flag.IntVar(&certmagic.HTTPPort, "http-port", certmagic.HTTPPort, "Default port to use for HTTP")
+	flag.IntVar(&certmagic.HTTPSPort, "https-port", certmagic.HTTPSPort, "Default port to use for HTTPS")
 	flag.StringVar(&Host, "host", DefaultHost, "Default host")
 	flag.StringVar(&Port, "port", DefaultPort, "Default port")
 	flag.StringVar(&Root, "root", DefaultRoot, "Root path of default site")
@@ -128,6 +128,8 @@ func (h *httpContext) saveConfig(key string, cfg *SiteConfig) {
 // be parsed and executed.
 func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
 	siteAddrs := make(map[string]string)
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
 
 	// For each address in each server block, make a new config
 	for _, sb := range serverBlocks {
@@ -172,15 +174,15 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 			// If default HTTP or HTTPS ports have been customized,
 			// make sure the ACME challenge ports match
 			var altHTTPPort, altTLSALPNPort int
-			if HTTPPort != DefaultHTTPPort {
-				portInt, err := strconv.Atoi(HTTPPort)
+			if httpPort != DefaultHTTPPort {
+				portInt, err := strconv.Atoi(httpPort)
 				if err != nil {
 					return nil, err
 				}
 				altHTTPPort = portInt
 			}
-			if HTTPSPort != DefaultHTTPSPort {
-				portInt, err := strconv.Atoi(HTTPSPort)
+			if httpsPort != DefaultHTTPSPort {
+				portInt, err := strconv.Atoi(httpsPort)
 				if err != nil {
 					return nil, err
 				}
@@ -190,7 +192,10 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 			// Make our caddytls.Config, which has a pointer to the
 			// instance's certificate cache and enough information
 			// to use automatic HTTPS when the time comes
-			caddytlsConfig := caddytls.NewConfig(h.instance)
+			caddytlsConfig, err := caddytls.NewConfig(h.instance)
+			if err != nil {
+				return nil, fmt.Errorf("creating new caddytls configuration: %v", err)
+			}
 			caddytlsConfig.Hostname = addr.Host
 			caddytlsConfig.Manager.AltHTTPPort = altHTTPPort
 			caddytlsConfig.Manager.AltTLSALPNPort = altTLSALPNPort
@@ -225,13 +230,16 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 // MakeServers uses the newly-created siteConfigs to
 // create and return a list of server instances.
 func (h *httpContext) MakeServers() ([]caddy.Server, error) {
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
+
 	// make a rough estimate as to whether we're in a "production
 	// environment/system" - start by assuming that most production
 	// servers will set their default CA endpoint to a public,
 	// trusted CA (obviously not a perfect heuristic)
 	var looksLikeProductionCA bool
 	for _, publicCAEndpoint := range caddytls.KnownACMECAs {
-		if strings.Contains(certmagic.CA, publicCAEndpoint) {
+		if strings.Contains(certmagic.Default.CA, publicCAEndpoint) {
 			looksLikeProductionCA = true
 			break
 		}
@@ -263,7 +271,7 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 		if !cfg.TLS.Enabled {
 			continue
 		}
-		if cfg.Addr.Port == HTTPPort || cfg.Addr.Scheme == "http" {
+		if cfg.Addr.Port == httpPort || cfg.Addr.Scheme == "http" {
 			cfg.TLS.Enabled = false
 			log.Printf("[WARNING] TLS disabled for %s", cfg.Addr)
 		} else if cfg.Addr.Scheme == "" {
@@ -278,7 +286,7 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 			// this is vital, otherwise the function call below that
 			// sets the listener address will use the default port
 			// instead of 443 because it doesn't know about TLS.
-			cfg.Addr.Port = HTTPSPort
+			cfg.Addr.Port = httpsPort
 		}
 		if cfg.TLS.ClientAuth != tls.NoClientCert {
 			if QUIC {
@@ -418,7 +426,7 @@ func (a Address) String() string {
 	}
 	scheme := a.Scheme
 	if scheme == "" {
-		if a.Port == HTTPSPort {
+		if a.Port == strconv.Itoa(certmagic.HTTPSPort) {
 			scheme = "https"
 		} else {
 			scheme = "http"
@@ -428,11 +436,12 @@ func (a Address) String() string {
 	if s != "" {
 		s += "://"
 	}
-	s += a.Host
 	if a.Port != "" &&
 		((scheme == "https" && a.Port != DefaultHTTPSPort) ||
 			(scheme == "http" && a.Port != DefaultHTTPPort)) {
-		s += ":" + a.Port
+		s += net.JoinHostPort(a.Host, a.Port)
+	} else {
+		s += a.Host
 	}
 	if a.Path != "" {
 		s += a.Path
@@ -498,6 +507,9 @@ func (a Address) Key() string {
 func standardizeAddress(str string) (Address, error) {
 	input := str
 
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
+
 	// Split input into components (prepend with // to assert host by default)
 	if !strings.Contains(str, "//") && !strings.HasPrefix(str, "/") {
 		str = "//" + str
@@ -519,9 +531,9 @@ func standardizeAddress(str string) (Address, error) {
 	// see if we can set port based off scheme
 	if port == "" {
 		if u.Scheme == "http" {
-			port = HTTPPort
+			port = httpPort
 		} else if u.Scheme == "https" {
-			port = HTTPSPort
+			port = httpsPort
 		}
 	}
 
@@ -531,17 +543,17 @@ func standardizeAddress(str string) (Address, error) {
 	}
 
 	// error if scheme and port combination violate convention
-	if (u.Scheme == "http" && port == HTTPSPort) || (u.Scheme == "https" && port == HTTPPort) {
+	if (u.Scheme == "http" && port == httpsPort) || (u.Scheme == "https" && port == httpPort) {
 		return Address{}, fmt.Errorf("[%s] scheme and port violate convention", input)
 	}
 
 	// standardize http and https ports to their respective port numbers
 	if port == "http" {
 		u.Scheme = "http"
-		port = HTTPPort
+		port = httpPort
 	} else if port == "https" {
 		u.Scheme = "https"
-		port = HTTPSPort
+		port = httpsPort
 	}
 
 	return Address{Original: input, Scheme: u.Scheme, Host: host, Port: port, Path: u.Path}, err
@@ -652,13 +664,14 @@ var directives = []string{
 	"s3browser", // github.com/techknowlogick/caddy-s3browser
 	"nobots",    // github.com/Xumeiquer/nobots
 	"mime",
-	"login",     // github.com/tarent/loginsrv/caddy
-	"reauth",    // github.com/freman/caddy-reauth
-	"extauth",   // github.com/BTBurke/caddy-extauth
-	"jwt",       // github.com/BTBurke/caddy-jwt
-	"jsonp",     // github.com/pschlump/caddy-jsonp
-	"upload",    // blitznote.com/src/caddy.upload
-	"multipass", // github.com/namsral/multipass/caddy
+        "login",      // github.com/tarent/loginsrv/caddy
+        "reauth",     // github.com/freman/caddy-reauth
+        "extauth",    // github.com/BTBurke/caddy-extauth
+        "jwt",        // github.com/BTBurke/caddy-jwt
+        "permission", // github.com/dhaavi/caddy-permission 
+        "jsonp",      // github.com/pschlump/caddy-jsonp
+        "upload",     // blitznote.com/src/caddy.upload
+        "multipass",  // github.com/namsral/multipass/caddy
 	"internal",
 	"pprof",
 	"expvar",
@@ -667,6 +680,7 @@ var directives = []string{
 	"prometheus", // github.com/miekg/caddy-prometheus
 	"templates",
 	"proxy",
+	"pubsub", // github.com/jung-kurt/caddy-pubsub
 	"fastcgi",
 	"cgi", // github.com/jung-kurt/caddy-cgi
 	"websocket",
@@ -681,6 +695,7 @@ var directives = []string{
 	"gopkg",     // github.com/zikes/gopkg
 	"restic",    // github.com/restic/caddy
 	"wkd",       // github.com/emersion/caddy-wkd
+	"dyndns",    // github.com/linkonoid/caddy-dyndns
 }
 
 const (
@@ -716,10 +731,4 @@ var (
 
 	// QUIC indicates whether QUIC is enabled or not.
 	QUIC bool
-
-	// HTTPPort is the port to use for HTTP.
-	HTTPPort = DefaultHTTPPort
-
-	// HTTPSPort is the port to use for HTTPS.
-	HTTPSPort = DefaultHTTPSPort
 )

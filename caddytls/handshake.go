@@ -17,9 +17,11 @@ package caddytls
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
+	"net"
 	"strings"
 
-	"github.com/mholt/caddy/telemetry"
+	"github.com/caddyserver/caddy/telemetry"
 	"github.com/mholt/certmagic"
 )
 
@@ -38,14 +40,31 @@ type configGroup map[string]*Config
 // This function follows nearly the same logic to lookup
 // a hostname as the getCertificate function uses.
 func (cg configGroup) getConfig(hello *tls.ClientHelloInfo) *Config {
-	name := certmagic.CertNameFromClientHello(hello)
+	name := certmagic.NormalizedName(hello.ServerName)
+	if name == "" {
+		name = certmagic.NormalizedName(certmagic.Default.DefaultServerName)
+	}
 
-	// exact match? great, let's use it
+	// if SNI is empty, prefer matching IP address (it is
+	// more specific than a "catch-all" configuration)
+	if name == "" && hello.Conn != nil {
+		addr := hello.Conn.LocalAddr().String()
+		ip, _, err := net.SplitHostPort(addr)
+		if err == nil {
+			addr = ip
+		}
+		if config, ok := cg[addr]; ok {
+			return config
+		}
+	}
+
+	// otherwise, try an exact match
 	if config, ok := cg[name]; ok {
 		return config
 	}
 
-	// try replacing labels in the name with wildcards until we get a match
+	// then try replacing labels in the name with
+	// wildcards until we get a match
 	labels := strings.Split(name, ".")
 	for i := range labels {
 		labels[i] = "*"
@@ -55,13 +74,48 @@ func (cg configGroup) getConfig(hello *tls.ClientHelloInfo) *Config {
 		}
 	}
 
-	// try a config that serves all names (the above
-	// loop doesn't try empty string; for hosts defined
-	// with only a port, for instance, like ":443") -
-	// also known as the default config
+	// try a config that matches all names - this
+	// is needed to match configs defined without
+	// a specific host, like ":443", when SNI is
+	// a non-empty value
 	if config, ok := cg[""]; ok {
 		return config
 	}
+
+	// failover with a random config: this is necessary
+	// because we might be needing to solve a TLS-ALPN
+	// ACME challenge for a name that we don't have a
+	// TLS configuration for; any config will do for
+	// this purpose
+	for _, config := range cg {
+		// important! disable on-demand TLS so we don't
+		// try to get certificates for unrecognized names;
+		// this requires a careful pointer dance... first
+		// make shallow copies of the structs
+		if config.Manager != nil && config.Manager.OnDemand != nil {
+			cfgCopy := *config
+			mgrCopy := *config.Manager
+			tlsCfgCopy := config.tlsConfig.Clone()
+
+			// then turn off on-demand TLS
+			mgrCopy.OnDemand = nil
+
+			// then change the copies; make sure the
+			// GetCertificate callback is updated so
+			// it points to our modified config
+			cfgCopy.Manager = &mgrCopy
+			tlsCfgCopy.GetCertificate = mgrCopy.GetCertificate
+			cfgCopy.tlsConfig = tlsCfgCopy
+
+			// finally, return the reconstructed config
+			return &cfgCopy
+		}
+		// if on-demand TLS was not enabled, we should
+		// be able to use this config directly
+		return config
+	}
+
+	log.Printf("[ERROR] No TLS configuration available for ClientHello with ServerName: %s", hello.ServerName)
 
 	return nil
 }

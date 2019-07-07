@@ -1,7 +1,7 @@
 package hook
 
 import (
-	"github.com/mholt/caddy"
+	"github.com/caddyserver/caddy"
 )
 
 // Config describes how Hook should be configured and used.
@@ -14,8 +14,7 @@ type Config struct {
 
 // SupportedEvents is a map of supported events.
 var SupportedEvents = map[string]caddy.EventName{
-	"startup":          caddy.StartupEvent,
-	"instance_startup": caddy.InstanceStartupEvent,
-	"shutdown":         caddy.ShutdownEvent,
-	"certrenew":        caddy.CertRenewEvent,
+	"startup":   caddy.InstanceStartupEvent,
+	"shutdown":  caddy.ShutdownEvent,
+	"certrenew": caddy.CertRenewEvent,
 }

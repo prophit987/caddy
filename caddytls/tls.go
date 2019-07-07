@@ -29,9 +29,9 @@
 package caddytls
 
 import (
-	"github.com/mholt/caddy"
+	"github.com/go-acme/lego/challenge"
+	"github.com/caddyserver/caddy"
 	"github.com/mholt/certmagic"
-	"github.com/xenolf/lego/challenge"
 )
 
 // ConfigHolder is any type that has a Config; it presumably is
@@ -93,7 +93,7 @@ var KnownACMECAs = []string{
 //
 // challenge.Provider is an interface that allows the implementation of custom
 // challenge providers. For more details, see:
-// https://godoc.org/github.com/xenolf/lego/acme#ChallengeProvider
+// https://godoc.org/github.com/go-acme/lego/acme#ChallengeProvider
 type ChallengeProvider challenge.Provider
 
 // DNSProviderConstructor is a function that takes credentials and
@@ -107,4 +107,20 @@ var dnsProviders = make(map[string]DNSProviderConstructor)
 func RegisterDNSProvider(name string, provider DNSProviderConstructor) {
 	dnsProviders[name] = provider
 	caddy.RegisterPlugin("tls.dns."+name, caddy.Plugin{})
+}
+
+// ClusterPluginConstructor is a function type that is used to
+// instantiate a new implementation of both certmagic.Storage
+// and certmagic.Locker, which are required for successful
+// use in cluster environments.
+type ClusterPluginConstructor func() (certmagic.Storage, error)
+
+// clusterProviders is the list of storage providers
+var clusterProviders = make(map[string]ClusterPluginConstructor)
+
+// RegisterClusterPlugin registers provider by name for facilitating
+// cluster-wide operations like storage and synchronization.
+func RegisterClusterPlugin(name string, provider ClusterPluginConstructor) {
+	clusterProviders[name] = provider
+	caddy.RegisterPlugin("tls.cluster."+name, caddy.Plugin{})
 }

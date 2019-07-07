@@ -25,35 +25,39 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/cpuid"
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddytls"
-	"github.com/mholt/caddy/telemetry"
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/caddyfile"
+	"github.com/caddyserver/caddy/caddytls"
+	"github.com/caddyserver/caddy/telemetry"
 	"github.com/mholt/certmagic"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 
-	_ "github.com/mholt/caddy/caddyhttp" // plug in the HTTP server type
+	_ "github.com/caddyserver/caddy/caddyhttp" // plug in the HTTP server type
 	// This is where other plugins get plugged in (imported)
 )
 
 func init() {
 	caddy.TrapSignals()
-	setVersion()
 
-	flag.BoolVar(&certmagic.Agreed, "agree", false, "Agree to the CA's Subscriber Agreement")
-	flag.StringVar(&certmagic.CA, "ca", certmagic.CA, "URL to certificate authority's ACME server directory")
-	flag.BoolVar(&certmagic.DisableHTTPChallenge, "disable-http-challenge", certmagic.DisableHTTPChallenge, "Disable the ACME HTTP challenge")
-	flag.BoolVar(&certmagic.DisableTLSALPNChallenge, "disable-tls-alpn-challenge", certmagic.DisableTLSALPNChallenge, "Disable the ACME TLS-ALPN challenge")
+	flag.BoolVar(&certmagic.Default.Agreed, "agree", false, "Agree to the CA's Subscriber Agreement")
+	flag.StringVar(&certmagic.Default.CA, "ca", certmagic.Default.CA, "URL to certificate authority's ACME server directory")
+	flag.StringVar(&certmagic.Default.DefaultServerName, "default-sni", certmagic.Default.DefaultServerName, "If a ClientHello ServerName is empty, use this ServerName to choose a TLS certificate")
+	flag.BoolVar(&certmagic.Default.DisableHTTPChallenge, "disable-http-challenge", certmagic.Default.DisableHTTPChallenge, "Disable the ACME HTTP challenge")
+	flag.BoolVar(&certmagic.Default.DisableTLSALPNChallenge, "disable-tls-alpn-challenge", certmagic.Default.DisableTLSALPNChallenge, "Disable the ACME TLS-ALPN challenge")
 	flag.StringVar(&disabledMetrics, "disabled-metrics", "", "Comma-separated list of telemetry metrics to disable")
 	flag.StringVar(&conf, "conf", "", "Caddyfile to load (default \""+caddy.DefaultConfigFile+"\")")
 	flag.StringVar(&cpu, "cpu", "100%", "CPU cap")
-	flag.StringVar(&envFile, "env", "", "Path to file with environment variables to load in KEY=VALUE format")
+	flag.BoolVar(&printEnv, "env", false, "Enable to print environment variables")
+	flag.StringVar(&envFile, "envfile", "", "Path to file with environment variables to load in KEY=VALUE format")
+	flag.BoolVar(&fromJSON, "json-to-caddyfile", false, "From JSON stdin to Caddyfile stdout")
 	flag.BoolVar(&plugins, "plugins", false, "List installed plugins")
-	flag.StringVar(&certmagic.Email, "email", "", "Default ACME CA account email address")
+	flag.StringVar(&certmagic.Default.Email, "email", "", "Default ACME CA account email address")
 	flag.DurationVar(&certmagic.HTTPTimeout, "catimeout", certmagic.HTTPTimeout, "Default ACME CA HTTP timeout")
 	flag.StringVar(&logfile, "log", "", "Process log file")
 	flag.IntVar(&logRollMB, "log-roll-mb", 100, "Roll process log when it reaches this many megabytes (0 to disable rolling)")
@@ -62,6 +66,7 @@ func init() {
 	flag.BoolVar(&caddy.Quiet, "quiet", false, "Quiet mode (no initialization output)")
 	flag.StringVar(&revoke, "revoke", "", "Hostname for which to revoke the certificate")
 	flag.StringVar(&serverType, "type", "http", "Type of server to run")
+	flag.BoolVar(&toJSON, "caddyfile-to-json", false, "From Caddyfile stdin to JSON stdout")
 	flag.BoolVar(&version, "version", false, "Show version")
 	flag.BoolVar(&validate, "validate", false, "Parse the Caddyfile but do not start the server")
 
@@ -73,9 +78,12 @@ func init() {
 func Run() {
 	flag.Parse()
 
+	module := getBuildModule()
+	cleanModVersion := strings.TrimPrefix(module.Version, "v")
+
 	caddy.AppName = appName
-	caddy.AppVersion = appVersion
-	certmagic.UserAgent = appName + "/" + appVersion
+	caddy.AppVersion = module.Version
+	certmagic.UserAgent = appName + "/" + cleanModVersion
 
 	// Set up process log before anything bad happens
 	switch logfile {
@@ -108,9 +116,15 @@ func Run() {
 		}
 	}
 
-	//Load all additional envs as soon as possible
+	// load all additional envs as soon as possible
 	if err := LoadEnvFromFile(envFile); err != nil {
 		mustLogFatalf("%v", err)
+	}
+
+	if printEnv {
+		for _, v := range os.Environ() {
+			fmt.Println(v)
+		}
 	}
 
 	// initialize telemetry client
@@ -133,9 +147,11 @@ func Run() {
 		os.Exit(0)
 	}
 	if version {
-		fmt.Printf("%s %s (unofficial)\n", appName, appVersion)
-		if devBuild && gitShortStat != "" {
-			fmt.Printf("%s\n%s\n", gitShortStat, gitFilesModified)
+		if module.Sum != "" {
+			// a build with a known version will also have a checksum
+			fmt.Printf("Caddy %s (%s)\n", module.Version, module.Sum)
+		} else {
+			fmt.Println(module.Version)
 		}
 		os.Exit(0)
 	}
@@ -143,6 +159,9 @@ func Run() {
 		fmt.Println(caddy.DescribePlugins())
 		os.Exit(0)
 	}
+
+	// Check if we just need to do a Caddyfile Convert and exit
+	checkJSONCaddyfile()
 
 	// Set CPU cap
 	err := setCPU(cpu)
@@ -177,7 +196,7 @@ func Run() {
 	}
 
 	// Begin telemetry (these are no-ops if telemetry disabled)
-	telemetry.Set("caddy_version", appVersion)
+	telemetry.Set("caddy_version", module.Version)
 	telemetry.Set("num_listeners", len(instance.Servers()))
 	telemetry.Set("server_type", serverType)
 	telemetry.Set("os", runtime.GOOS)
@@ -258,24 +277,55 @@ func defaultLoader(serverType string) (caddy.Input, error) {
 	}, nil
 }
 
-// setVersion figures out the version information
-// based on variables set by -ldflags.
-func setVersion() {
-	// A development build is one that's not at a tag or has uncommitted changes
-	devBuild = gitTag == "" || gitShortStat != ""
-
-	if buildDate != "" {
-		buildDate = " " + buildDate
-	}
-
-	// Only set the appVersion if -ldflags was used
-	if gitNearestTag != "" || gitTag != "" {
-		if devBuild && gitNearestTag != "" {
-			appVersion = fmt.Sprintf("%s (+%s%s)",
-				strings.TrimPrefix(gitNearestTag, "v"), gitCommit, buildDate)
-		} else if gitTag != "" {
-			appVersion = strings.TrimPrefix(gitTag, "v")
+// getBuildModule returns the build info of Caddy
+// from debug.BuildInfo (requires Go modules). If
+// no version information is available, a non-nil
+// value will still be returned, but with an
+// unknown version.
+func getBuildModule() *debug.Module {
+	bi, ok := debug.ReadBuildInfo()
+	if ok {
+		// The recommended way to build Caddy involves
+		// creating a separate main module, which
+		// preserves caddy a read-only dependency
+		// TODO: track related Go issue: https://github.com/golang/go/issues/29228
+		for _, mod := range bi.Deps {
+			if mod.Path == "github.com/caddyserver/caddy" {
+				return mod
+			}
 		}
+	}
+	return &debug.Module{Version: "unknown"}
+}
+
+func checkJSONCaddyfile() {
+	if fromJSON {
+		jsonBytes, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Read stdin failed: %v", err)
+			os.Exit(1)
+		}
+		caddyfileBytes, err := caddyfile.FromJSON(jsonBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Converting from JSON failed: %v", err)
+			os.Exit(2)
+		}
+		fmt.Println(string(caddyfileBytes))
+		os.Exit(0)
+	}
+	if toJSON {
+		caddyfileBytes, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Read stdin failed: %v", err)
+			os.Exit(1)
+		}
+		jsonBytes, err := caddyfile.ToJSON(caddyfileBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Converting to JSON failed: %v", err)
+			os.Exit(2)
+		}
+		fmt.Println(string(jsonBytes))
+		os.Exit(0)
 	}
 }
 
@@ -411,13 +461,10 @@ func initTelemetry() error {
 			// mitigate disk space exhaustion at the collection endpoint
 			return fmt.Errorf("too many metrics to disable")
 		}
-		disabledMetricsSlice = strings.Split(disabledMetrics, ",")
-		for i, metric := range disabledMetricsSlice {
+		disabledMetricsSlice = splitTrim(disabledMetrics, ",")
+		for _, metric := range disabledMetricsSlice {
 			if metric == "instance_id" || metric == "timestamp" || metric == "disabled_metrics" {
 				return fmt.Errorf("instance_id, timestamp, and disabled_metrics cannot be disabled")
-			}
-			if metric == "" {
-				disabledMetricsSlice = append(disabledMetricsSlice[:i], disabledMetricsSlice[i+1:]...)
 			}
 		}
 	}
@@ -432,6 +479,27 @@ func initTelemetry() error {
 	}
 
 	return nil
+}
+
+// Split string s into all substrings separated by sep and returns a slice of
+// the substrings between those separators.
+//
+// If s does not contain sep and sep is not empty, Split returns a
+// slice of length 1 whose only element is s.
+//
+// If sep is empty, Split splits after each UTF-8 sequence. If both s
+// and sep are empty, Split returns an empty slice.
+//
+// Each item that in result is trim space and not empty string
+func splitTrim(s string, sep string) []string {
+	splitItems := strings.Split(s, sep)
+	trimItems := make([]string, 0, len(splitItems))
+	for _, item := range splitItems {
+		if item = strings.TrimSpace(item); item != "" {
+			trimItems = append(trimItems, item)
+		}
+	}
+	return trimItems
 }
 
 // LoadEnvFromFile loads additional envs if file provided and exists
@@ -516,27 +584,17 @@ var (
 	conf            string
 	cpu             string
 	envFile         string
+	fromJSON        bool
 	logfile         string
 	logRollMB       int
 	logRollCompress bool
 	revoke          string
+	toJSON          bool
 	version         bool
 	plugins         bool
+	printEnv        bool
 	validate        bool
 	disabledMetrics string
-)
-
-// Build information obtained with the help of -ldflags
-var (
-	appVersion = "(untracked dev build)" // inferred at startup
-	devBuild   = true                    // inferred at startup
-
-	buildDate        string // date -u
-	gitTag           string // git describe --exact-match HEAD 2> /dev/null
-	gitNearestTag    string // git describe --abbrev=0 --tags HEAD
-	gitCommit        string // git rev-parse HEAD
-	gitShortStat     string // git diff-index --shortstat
-	gitFilesModified string // git diff-index --name-only HEAD
 )
 
 // EnableTelemetry defines whether telemetry is enabled in Run.

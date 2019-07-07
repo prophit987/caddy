@@ -19,13 +19,14 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
+	"time"
 
-	"github.com/xenolf/lego/challenge/tlsalpn01"
+	"github.com/go-acme/lego/challenge/tlsalpn01"
 
+	"github.com/go-acme/lego/certcrypto"
 	"github.com/klauspost/cpuid"
-	"github.com/mholt/caddy"
+	"github.com/caddyserver/caddy"
 	"github.com/mholt/certmagic"
-	"github.com/xenolf/lego/certcrypto"
 )
 
 // Config describes how TLS should be configured and used.
@@ -93,25 +94,61 @@ type Config struct {
 }
 
 // NewConfig returns a new Config with a pointer to the instance's
-// certificate cache. You will usually need to set Other fields on
+// certificate cache. You will usually need to set other fields on
 // the returned Config for successful practical use.
-func NewConfig(inst *caddy.Instance) *Config {
+func NewConfig(inst *caddy.Instance) (*Config, error) {
 	inst.StorageMu.RLock()
 	certCache, ok := inst.Storage[CertCacheInstStorageKey].(*certmagic.Cache)
 	inst.StorageMu.RUnlock()
 	if !ok || certCache == nil {
-		certCache = certmagic.NewCache(certmagic.DefaultStorage)
+		if err := makeClusteringPlugin(); err != nil {
+			return nil, err
+		}
+		certCache = certmagic.NewCache(certmagic.CacheOptions{
+			GetConfigForCert: func(cert certmagic.Certificate) (certmagic.Config, error) {
+				inst.StorageMu.RLock()
+				cfgMap, ok := inst.Storage[configMapKey].(map[string]*Config)
+				inst.StorageMu.RUnlock()
+				if ok {
+					for hostname, cfg := range cfgMap {
+						if cfg.Manager != nil && hostname == cert.Names[0] {
+							return *cfg.Manager, nil
+						}
+					}
+				}
+				return certmagic.Default, nil
+			},
+		})
+
+		storageCleaningTicker := time.NewTicker(12 * time.Hour)
+		done := make(chan bool)
+		go func() {
+			for {
+				select {
+				case <-done:
+					storageCleaningTicker.Stop()
+					return
+				case <-storageCleaningTicker.C:
+					certmagic.CleanStorage(certmagic.Default.Storage, certmagic.CleanStorageOptions{
+						OCSPStaples: true,
+					})
+				}
+			}
+		}()
 		inst.OnShutdown = append(inst.OnShutdown, func() error {
 			certCache.Stop()
+			done <- true
+			close(done)
 			return nil
 		})
+
 		inst.StorageMu.Lock()
 		inst.Storage[CertCacheInstStorageKey] = certCache
 		inst.StorageMu.Unlock()
 	}
 	return &Config{
-		Manager: certmagic.NewWithCache(certCache, certmagic.Config{}),
-	}
+		Manager: certmagic.New(certCache, certmagic.Config{}),
+	}, nil
 }
 
 // buildStandardTLSConfig converts cfg (*caddytls.Config) to a *tls.Config
@@ -257,9 +294,13 @@ func MakeTLSConfig(configs []*Config) (*tls.Config, error) {
 		// configs with the same hostname pattern; should
 		// be OK since we already asserted they are roughly
 		// the same); during TLS handshakes, configs are
-		// loaded based on the hostname pattern, according
-		// to client's SNI
-		configMap[cfg.Hostname] = cfg
+		// loaded based on the hostname pattern according
+		// to client's ServerName (SNI) value
+		if cfg.Hostname == "0.0.0.0" || cfg.Hostname == "::" {
+			configMap[""] = cfg
+		} else {
+			configMap[cfg.Hostname] = cfg
+		}
 	}
 
 	// Is TLS disabled? By now, we know that all
@@ -274,7 +315,7 @@ func MakeTLSConfig(configs []*Config) (*tls.Config, error) {
 		// A tls.Config must have Certificates or GetCertificate
 		// set, in order to be accepted by tls.Listen and quic.Listen.
 		// TODO: remove this once the standard library allows a tls.Config with
-		// only GetConfigForClient set. https://github.com/mholt/caddy/pull/2404
+		// only GetConfigForClient set. https://github.com/caddyserver/caddy/pull/2404
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return nil, fmt.Errorf("all certificates configured via GetConfigForClient")
 		},
@@ -332,16 +373,9 @@ func assertConfigsCompatible(cfg1, cfg2 *Config) error {
 	if c1.MaxVersion != c2.MaxVersion {
 		return fmt.Errorf("maximum TLS version mismatch")
 	}
-	if c1.ClientAuth != c2.ClientAuth {
-		return fmt.Errorf("client authentication policy mismatch")
-	}
-	if c1.ClientAuth != tls.NoClientCert && c2.ClientAuth != tls.NoClientCert && c1.ClientCAs != c2.ClientCAs {
-		// Two hosts defined on the same listener are not compatible if they
-		// have ClientAuth enabled, because there's no guarantee beyond the
-		// hostname which config will be used (because SNI only has server name).
-		// To prevent clients from bypassing authentication, require that
-		// ClientAuth be configured in an unambiguous manner.
-		return fmt.Errorf("multiple hosts requiring client authentication ambiguously configured")
+
+	if err := assertClientCertsCompatible(cfg1, cfg2); err != nil {
+		return err
 	}
 
 	return nil
@@ -381,7 +415,7 @@ func SetDefaultTLSParams(config *Config) {
 		config.ProtocolMinVersion = tls.VersionTLS12
 	}
 	if config.ProtocolMaxVersion == 0 {
-		config.ProtocolMaxVersion = tls.VersionTLS12
+		config.ProtocolMaxVersion = tls.VersionTLS13
 	}
 
 	// Prefer server cipher suites
@@ -392,7 +426,6 @@ func SetDefaultTLSParams(config *Config) {
 var supportedKeyTypes = map[string]certcrypto.KeyType{
 	"P384":    certcrypto.EC384,
 	"P256":    certcrypto.EC256,
-	"RSA8192": certcrypto.RSA8192,
 	"RSA4096": certcrypto.RSA4096,
 	"RSA2048": certcrypto.RSA2048,
 }
@@ -404,6 +437,7 @@ var SupportedProtocols = map[string]uint16{
 	"tls1.0": tls.VersionTLS10,
 	"tls1.1": tls.VersionTLS11,
 	"tls1.2": tls.VersionTLS12,
+	"tls1.3": tls.VersionTLS13,
 }
 
 // GetSupportedProtocolName returns the protocol name
@@ -463,10 +497,6 @@ var defaultCiphers = []uint16{
 	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
 	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-	tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 }
 
 // List of ciphers we should prefer if native AESNI support is missing
@@ -477,16 +507,12 @@ var defaultCiphersNonAESNI = []uint16{
 	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-	tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 }
 
 // getPreferredDefaultCiphers returns an appropriate cipher suite to use, depending on
 // the hardware support available for AES-NI.
 //
-// See https://github.com/mholt/caddy/issues/1674
+// See https://github.com/caddyserver/caddy/issues/1674
 func getPreferredDefaultCiphers() []uint16 {
 	if cpuid.CPU.AesNi() {
 		return defaultCiphers
@@ -494,6 +520,37 @@ func getPreferredDefaultCiphers() []uint16 {
 
 	// Return a cipher suite that prefers ChaCha20
 	return defaultCiphersNonAESNI
+}
+
+func assertClientCertsCompatible(cfg1, cfg2 *Config) error {
+	c1, c2 := cfg1.tlsConfig, cfg2.tlsConfig
+	if c1.ClientAuth != c2.ClientAuth {
+		return fmt.Errorf("client authentication policy mismatch")
+	}
+
+	if c1.ClientAuth == tls.NoClientCert || c2.ClientAuth == tls.NoClientCert {
+		return nil
+	}
+
+	ccerts1, ccerts2 := cfg1.ClientCerts, cfg2.ClientCerts
+
+	if len(ccerts1) != len(ccerts2) {
+		return fmt.Errorf("number of client certs differs")
+	}
+
+	// The order of client CAs matters
+	for i, v := range ccerts1 {
+		if v != ccerts2[i] {
+			// Two hosts defined on the same listener are not compatible if they
+			// have ClientAuth enabled, because there's no guarantee beyond the
+			// hostname which config will be used (because SNI only has server name).
+			// To prevent clients from bypassing authentication, require that
+			// ClientAuth be configured in an unambiguous manner.
+			return fmt.Errorf("multiple hosts requiring client authentication ambiguously configured")
+		}
+	}
+
+	return nil
 }
 
 // Map of supported curves
@@ -514,6 +571,8 @@ var defaultCurves = []tls.CurveID{
 	tls.X25519,
 	tls.CurveP256,
 }
+
+var clusterPluginSetup int32 // access atomically
 
 // CertCacheInstStorageKey is the name of the key for
 // accessing the certificate storage on the *caddy.Instance.

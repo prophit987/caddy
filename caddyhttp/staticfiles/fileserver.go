@@ -28,7 +28,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mholt/caddy"
+	"github.com/caddyserver/caddy"
 )
 
 // FileServer implements a production-ready file server
@@ -53,6 +53,9 @@ type FileServer struct {
 
 // ServeHTTP serves static files for r according to fs's configuration.
 func (fs FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+	if r.Method != "GET" && r.Method != "HEAD" {
+		return http.StatusMethodNotAllowed, nil
+	}
 	return fs.serveFile(w, r)
 }
 
